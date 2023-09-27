@@ -1,0 +1,784 @@
+---
+title: "Fuzzifying Clustering on Empirical Data"
+author: "Jonathan J. Park - The Pennsylvania State University"
+date: "02/01/2023"
+header-includes:
+- \usepackage{ctex}
+- \usepackage{graphicx}
+- \usepackage{amsopn}
+- \usepackage{amsmath, mathtools}
+- \usepackage[sc]{mathpazo}
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 4
+    toc_float: TRUE
+    theme: darkly
+    code_folding: hide
+  word_document: default
+  pdf_document:
+    latex_engine: xelatex
+editor_options:
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE,
+                      tidy = TRUE, message = FALSE, 
+                      fig.align = 'center')
+packs = list('igraph','vars','mclust',
+             'fclust','MIIVsem','qgraph',
+             'dplyr','DescTools','vars')
+lapply(packs, require, character.only = T)
+options(width = 999)
+set.seed(1597)
+phi1= matrix(c(0.7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+        0.0,0.0,-0.2,0.7,0.0,-0.2,0.0,0.0,0.0,0.0,0.0,-0.2,0.0,0.0,0.7,0.0,0.0,0.0,-0.2,
+        0.0,0.0,0.0,0.0,-0.2,-0.2,0.7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.7,0.0,
+        0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.7,0.0,0.0,0.0,0.0,0.0,-0.2,-0.2,0.0,-0.2,
+        0.0,0.7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.7,0.0,0.0,0.0,0.0,-0.2,0.0,
+        0.0,0.0,0.0,0.0,0.7),10,10)
+```
+
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+
+```{r functions, include = FALSE}
+# Building the Sum of Squares and Cross Products (SSCP) Matrix [MIIVsem]
+  buildSSCP <- function(sample.cov, sample.mean, sample.nobs, namesofmat){
+  
+  if (is.null(sample.cov)){
+    
+    res <- NULL
+    
+  } else {
+    
+    res <- matrix(NA, length(sample.mean)+1, length(sample.mean)+1,
+                  dimnames = list(c("1", namesofmat),
+                                  c("1", namesofmat)))
+  
+    res[1,1]   <- sample.nobs
+    res[-1,1]  <- res[1,-1] <- sample.mean*sample.nobs
+    res[-1,-1] <- (sample.cov + sample.mean %*% t(sample.mean))*sample.nobs
+  }
+  
+  return(res)
+  
+}
+# Sparsity Maximization function from S-GIMME; Park & Fisher
+  modmax <- function(x, m, sub_method){
+      # sparsify m based on x
+      diag(m) <- 0
+      m[which(m <= stats::quantile(m[upper.tri(m, diag = FALSE)], x))] <- 0
+      olm = m
+      m = graph_from_adjacency_matrix(m, mode = 'undirected')
+      weights      <- E(m)$weight
+        if (sub_method == "Walktrap")
+          p = cluster_walktrap(m, weights = weights, steps = 4)
+        if (sub_method == "Infomap")
+          p = cluster_infomap(m, e.weights = weights)
+        if (sub_method == "Edge Betweenness")
+          p = cluster_edge_betweenness(m, weights = weights)
+        if (sub_method == "Fast Greedy")
+          p = cluster_fast_greedy(m, weights = weights)
+        if (sub_method == "Label Prop")
+          p = cluster_label_prop(m, weights = weights)
+        if (sub_method == "Leading Eigen")
+          p = cluster_leading_eigen(m, weights = weights)
+        if (sub_method == "Louvain")
+          p = cluster_louvain(m, weights = weights)
+        if (sub_method == "Spinglass")
+          p = cluster_spinglass(m, weights = weights)
+      modval <- igraph::modularity(p)
+      sk = ask = list()
+      mem = p$membership
+      dim = length(mem)
+
+      for(i in 1:dim){
+        sk[i] = 0
+        ask[i] = 0
+        for(j in 1:dim){
+          if(olm[i,j] == 0){NULL}else{
+            if(mem[i] == mem[j]){ask[[i]] = ask[[i]] + olm[i,j]}else{
+              sk[[i]] = sk[[i]] + olm[i,j]
+            }
+          }
+        }
+        sk[[i]] = sk[[i]]/2
+        ask[[i]] = sk[[i]] + ask[[i]]/2
+      }
+      sk = unlist(sk); ask = unlist(ask)
+
+      temp.1 = cbind(mem, sk, ask)
+      
+      clist = matrix(NA, 1, max(mem))
+      for(i in 1:max(temp.1[,1])){
+        if(temp.1[mem == i,2] == 0 && temp.1[mem == i,3] == 0){
+          clist[1,i] = 1
+        }else{
+          clist[1,i] = sum(temp.1[mem == i,2]) / 
+            sum(temp.1[mem == i,3])  
+        }
+      }
+      simplified = round(clist, 3)
+      (conductance = 1 - sum(simplified)/length(simplified))
+      return(-1*conductance)
+  }
+```
+
+Hello `dynr` lab (and possibly a wider audience if it comes to that but I have doubts)!
+
+These are some snippets of some analyses I've conducted for the book chapter I've been working on with Sy-Miin and Peter written into a bloggy-kind of style. One thing I think we need more of on the QDev tutorials site is more context and personality. At times, tutorials can be written so directly that they can be hard to follow. So, I decided to take a stab at writing one in a more conversational fashion.
+
+Broadly, the book chapter is about introducing fuzzy clustering to the behavioral sciences and making use of it in a way that isn't traditionally seen in the literature. Before I can really delve into that though, I should probably give a very brief primer on what clustering in general before going off on the unique aspects of fuzziness.
+
+# Vanilla Community Detection ¯\\\_(ツ)\_/¯
+
+In this section, I'll describe the goals of community detection in a broad sense. Generally, community detection is for identifying groups of `things` that are more similar to each other than they are to `other things`. We live in a world defined by groups and we implicitly know that some things belong with each other while other things don't.
+
+Take--for instance--vegetables and fruits. We can look at some identifying features of an apple and determine that apples are qualitatively different from a carrot. As we extend this comparison to more fruits and vegetables, we can begin to draw boundaries between which foods "belong together". The first part of this tutorial will simply be that, looking for groups.
+
+
+## Goals of Comunity Detection ¯\\\_(ツ)\_/¯
+
+Why do we give a `$h!+` if there are "communities" in our data? Well, good question Rhetorical Jonathan! The reason why finding communities in our data depends mainly on the kind of data we're constructing. With our earlier example on fruits and vegetables, we might want to identify key characteristics that make a fruit a fruit and a vegetable a vegetable. Things like, the presence of seeds or how disgusting they are to have at dinner can be things we use to describe the differences.
+
+Of course, as humans we're pretty good at drawing arbitrary boundaries between things and distinguishing groups. However, it's another thing entirely to teach a computer how to understand the differences between things. Thus, we need to formulate those differences using \emph{THE POWER OF MATHS}.
+
+Below, we introduce the concept of an adjacency matrix:
+
+$$\mathbf{A} = \begin{bmatrix}
+a_{11} & a_{12} & a_{13} & a_{14} \\
+a_{21} & a_{22} & a_{23} & a_{24} \\
+a_{31} & a_{32} & a_{33} & a_{34} \\
+a_{41} & a_{42} & a_{43} & a_{44}
+\end{bmatrix}$$
+
+This is the heart and soul of community detection and our best friend in our endeavor to teach computers to find groups good [grammatical error intention for emphasis]. The adjacency matrix is a symmetric matrix where each cell, $a_{ij};i \neq j$ indicates the similarity or connection strength between the $i^{th}$ and $j^{th}$ case. Typically, the diagonal elements will be fixed to $0.00$.
+
+This will then be fed into any number of community detection algorithms of varying sophistication and ultimately yield some sort of communities that we can evaluate! 
+
+So, let's say we have an adjacency matrix... What's a good community detection algorithm to start with? Well, $k$-means of course! Let's introduce that concept and then apply it to some real data.
+
+## $k$-means Clustering
+
+We can introduce $k$-means clustering as an algorithm designed to assign $N$ data-points to $k$ communities. We can describe the algorithm as follows:
+
+  1. Randomly initialize $k$ centroids
+  2. Assign each data-point to a cluster centroid based on its distance from that centroid
+  3. Recalculate the value of the centroids using only values from the data-points within the group
+  4. Iterate over steps 2 \& 3 until some convergence criterion is reached
+
+Where the objective function that we try to minimize is the sum of squared distances between each subject to its assigned centroid across all clusters:
+
+$$\argmin_{s} \sum_{i=1}^{k}\sum_{x\in S_{i}} \norm{x - \mu_i}^2$$
+where $k$ is the total number of clusters to partition, $S$ is the $i^{th}$ cluster, and $\mu_i$ is the centroid of the $i^{th}$ cluster. Simply put, $k$-means clustering attempts to identify partitions of variables where the within-cluster variance is minimized relative to the cluster-specific centroid. Simple as that!
+
+So, let's give it a shot with some real data.
+
+# Hard Mean-Level Clustering ¯\\\_(ツ)\_/¯
+
+As I noted before, the information we put into our adjacency matrix really determines how we will interpret the results that we get out of a community detection search. In this case, we'll be looking at mean-level data from a sample of $N = 54$ subjects where 27 had a clinical diagnosis of Major Depressive Disorder and 27 were pair-matched controls.
+
+In this section, we'll be exploring the De Vos et al. (2017) dataset. The dataset contains $N = 54$ subjects who either have Major Depressive
+Disorder (MDD) or are functionally pair-matched controls ($n_{dep} = 27$; $n_{con} = 27$). In the first set of analyses, we will be assessing for cluster-based differences in the mean-structures of all subjects and asking the question of whether cluster assignment aligns with clinical diagnoses. Essentially, we are searching for whether there are clusters of individuals based on their within-subject means on 14 affect related variables.
+
+### Reading in the Data
+
+We'll be using the `fclust` package and--specifically--the `FKM()` function from that package to conduct our analyses for the sake of future arguments down the road. We'll begin by reading in the data:
+
+```{r, echo = TRUE}
+tdat = read.csv('./Datasets/raw.csv', sep = '',skip = 1, header = F)
+  ID=rep(1:54, each = 90)
+  tdat = cbind(tdat[,2:16], ID)
+  vars = c("talkative","energetic","tense","anxious","enthusiastic",
+           "confident","distracted","restless","irritated","satisfied",
+           "happy","depressed","cheerful","guilty")
+  names(tdat) = c('Group', vars, 'ID')
+```
+```{r, echo = FALSE}
+means = matrix(NA, length(unique(tdat$ID)), 14)
+  for(i in unique(tdat$ID)){
+    tmpy = tdat[tdat$ID == i,2:15]
+    means[i,] = apply(tmpy, 2, mean, na.rm = TRUE)
+  }
+means = data.frame(means)
+names(means) = names(tdat)[2:15]
+```
+
+### K-Means on Data
+
+Now that the data are read in, we can select our variables and enumerate out some groups. Since we know that there are 2 clinical groups, why don't we try to extract 2 groups and then extract a third group for the sake of comparison:
+
+```{r, echo = FALSE, fig.width = 10.00, fig.height = 15.00}
+# Enumerating 2 or 3 clusters
+  clust11=FKM(means[,1:14],k=2,m=1.01)
+  clust12=FKM(means[,1:14],k=3,m=1.01)
+# Plots of "discrete" cluster solutions
+  par(mfrow = c(2,1))
+  plot(clust11, v1v2 = c(12,11), umin=0.7)
+  plot(clust12, v1v2 = c(12,11), umin=0.7)
+```
+
+The plots above show us that the group placements really begin to differ in that central area where depression and happiness are at the middle of the scale. Where, the third group essentially becomes a majority of those placed in the central area.
+
+### Cluster Performance Metrics
+
+So, how might we go about deciding which enumeration to use? 2-groups or 3?
+Well, the `FKM` package does have some metrics for assessing the quality of our partitions:
+
+```{r}
+# Cluster Quality Indices
+  round(Fclust.index(clust11),2); round(Fclust.index(clust12),2)
+```
+
+While I *could* go into detail regarding what each of these means, I'll avoid it for now. Just know that all of the values are essentially equivalent with very minor differences across them. Thus, without a clear sign of certainty, we would go with the more parsimonious option; a 2-group solution.
+
+### Visualizing Group Differences
+
+Now, let's look at our groups:
+
+```{r, echo = FALSE, fig.width = 10.00, fig.height = 5.00}
+qgraph::qgraph(cor(means[clust11$clus[,1]==1,1:14]), graph = 'glasso', sampleSize = 21,
+               theme = 'colorblind', layout = 'spring', fade = TRUE)
+qgraph::qgraph(cor(means[clust11$clus[,1]==2,1:14]), graph = 'glasso', sampleSize = 33,
+               theme = 'colorblind', layout = 'spring', fade = TRUE)
+```
+
+From the above regularized correlation network, we can see that the first group--which is primarily composed of our depressed people is sparser in the inter-affect space relative to our second group [this can be judged both by the boldness of the lines but also the fact that the repulsion used to generate the placement of nodes in the graph results in them being further apart]. 
+
+### Group Differences in Means
+
+In addition, these groups differ quantitatively in some features such as their mean-levels of depression and happiness--for example:
+```{r}
+# t-test on Depression
+  t.test(means[clust11$clus[,1]==1,12],means[clust11$clus[,1]==2,12])
+# t-test on Happiness
+  t.test(means[clust11$clus[,1]==1,11],means[clust11$clus[,1]==2,11])
+```
+
+### Real Life and Cluster Solutions
+
+Now, that's all fine and good but I bet you're wondering how well these match up with clinical diagnoses. Well, we can check that!
+
+```{r}
+Fclust.compare(c(rep(1,27),rep(2,27)), clust11$U)
+```
+
+The adjusted Rand index--or ARI--is a measure of how well we classified people given that we know the true membership. An ARI above 0.75 would be ideal but here, we get a value of 0.39 which isn't the best but what does that *really* mean?
+
+```{r echo = FALSE, eval = FALSE}
+cbind(c(rep(1,27),rep(2,27)), clust11$clus[,1])
+sum(abs(c(rep(1,27),rep(2,27)) - clust11$clus[,1]))
+```
+
+Well, in looking at the raw numbers, it means that we classified about 10-people incorrectly relative to the true diagnoses. Mainly, those subjects being people in the depressed group being incorrectly labeled as controls.
+
+
+Now, the title of this section is "Hard" mean-level clustering. Does that mean that there's an alternative version we could use? Indeed there is. It's the fuzzy clustering approach! Let's dig into that now.
+
+# Fuzzy Mean-Level Clustering
+
+Addressing the question of: what is "fuzziness" would probably be a good place to start. Fundamentally, fuzziness is a concept pertaining to the idea of uncertainty around a boundary. In the case of community detection, it's about allowing for some ambiguity around the edges of our clusters to acknowledge that things don't always fall into neat little bins.
+
+Let's go back to the original example where we talk about fruits and vegetables. While an apple is clearly a fruit and a carrot is a vegetable, you'll still see people at each other's throats when it comes to thinks like cucumbers and tomatoes being fruit or vegetable. The reason for this is something that isn't worth our time but it does highlight the need for methods that acknowledge that there are some things that are so close to the boundaries that we may want to allow for more wiggle room in our analyses.
+
+### How Do You Even $C$-Means?
+
+So, how is fuzzy clustering different than hard clustering? In the $k$-means case, we evolve into fuzzy $c$-means where:
+
+$$\argmin_{s} \sum_{i=1}^{n}\sum_{j=1}^{s} w_{ij}^m\norm{x_{i} - s_j}^2$$
+where $m$ is the fuzzifier--$m \in \mathbb{R}$ where $m \geq 1$--which determines the degree of fuzziness in the cluster solution, $w_{ij}^{m}$ is the degree to which the $i^{th}$ element of $x$ belongs to the $j^{th}$ cluster. Formally, $w_{ij}^{m}$ may be calculated as:
+
+$$w_{ij} = \frac{1}{\sum_{k=1}^{s}\left(\frac{\norm{x_{i} - s_{j}}}{\norm{x_{i} - s_{k}}}\right)^{\frac{2}{m-1}}}$$
+
+The calculation of the centroids must also be reworked due to the introduction of fuzziness. In particular, the centroids must be weighted by the degree of membership and can be expressed as:
+
+$$C_{s} = \frac{\sum_{x}w_{s}(x)^{m}x}{\sum_{x}w_{s}(x)^m}$$
+
+where the centroid of the $s^{th}$ cluster is the mean of all datapoints weighted by their degree of membership within that specific cluster. 
+
+So, essentially, the only real difference is that we include a weight in the objective function that determines how "fuzzy" we will allow our clusters to be. Simple as that!
+
+In the physics literature, fuzziness is a way of making the centroids more robust to ourliers in the data and that could certainly be useful here in the behavioral sciences; however, there may be some additional uses that we're not quite privy to yet. Let's check it out and see by running FCM on the de Vos data.
+
+### FCM on De Vos Data
+
+Below, we analyze the De Vos data but this time we use fuzzy clustering. In addition, I took the liberty of emphasizing data-points that do not firmly belong to one group or another (black points). In the two dimensions that we see--of the 14 possible--we see that the ambiguous subjects tend to be in the middle of depressed and happy on the continuum.
+
+```{r, echo = FALSE, fig.width = 10.00, fig.height = 15.00}
+clust21=FKM(means[,1:14],k=2,m=2)
+clust22=FKM(means[,1:14],k=3,m=2)
+# Plots of "discrete" cluster solutions
+  par(mfrow = c(2,1))
+  plot(clust21, v1v2 = c(12,11), umin=0.7)
+  plot(clust22, v1v2 = c(12,11), umin=0.7)
+```
+
+### Fuzzy Cluster Performance Metrics
+
+So, how might we go about deciding which enumeration to use? 2-groups or 3?
+Well, the `FKM` package does have some metrics for assessing the quality of our partitions:
+
+```{r}
+# Cluster Quality Indices
+  round(Fclust.index(clust21),2); round(Fclust.index(clust22),2)
+```
+
+In the quality indices above, we actually see that the fuzzy 2-cluster solution is better than the fuzzy 3-cluster solution with higher PC and SIL.F values and a lower PE and XB value. Thus, we would lean towards preferring this enumeration but how does it perform?
+
+Well, looking at raw numbers, we put 5-subjects into the wrong diagnostic group compared to the hard clustering approach: 1 control into depressed and 4 depressed into the control group. This is a 50% reduction in error!
+
+### Fuzzy Mean Comparisons
+
+On the flip side, we did exclude 15 people from being clustered. What's with that? Don't they have meaningful data? Well, yes. They absolutely do. Let's describe the "fuzzy" people!
+
+In sum, all but 2 fuzzy people are subjects with clinical diagnoses of major depressive disorder and are undergoing out-patient care. Thus, if things were working, the reason why these people don't match well with the purely depressed group or the purely healthy group is that they are somewhere in the middle.
+
+Let's check out their depression levels:
+
+```{r}
+t.test(means[c(1,2,3,6,7,9,16,18,20,21,22,24,26,28,39),12], 
+       means[c(4,8,12:15,19,23,25,27,29),12])
+t.test(means[c(1,2,3,6,7,9,16,18,20,21,22,24,26,28,39),12], 
+       means[c(5,10,11,17,30:39,40:54),12])
+```
+
+As expected, we see that the fuzzy people--despite their diagnoses--are statistically higher in depression compared to the solidly depressed group yet still appreciably lower than the controls. Nifty.
+
+```{r, echo = FALSE, eval = FALSE, fig.width = 10.00, fig.height = 5.00}
+clust21$clus[,1][clust21$clus[,2] > 0.7 & clust21$clus[,1] == 1]
+clust21$clus[,1][clust21$clus[,2] > 0.7 & clust21$clus[,1] == 2]
+clust21$clus[,1][clust21$clus[,2] < 0.7]
+
+qgraph::qgraph(cor(means[c(5,10,11,17,30:39,40:54),1:14]), graph = 'glasso', sampleSize = 29,
+               theme = 'colorblind', layout = 'spring', fade = TRUE)
+qgraph::qgraph(cor(means[c(4,8,12:15,19,23,25,27,29),1:14]), graph = 'glasso', sampleSize = 11,
+               theme = 'colorblind', layout = 'spring', fade = TRUE)
+
+```
+
+Ultimately, the fuzziness allows us to be more certain of the people who ***are*** within the groups at the cost of excluding people should we choose to threshold them out.
+
+# Clustering on the Dynamics
+
+Now, all of the discussion to this point has been on the means but we also care about the dynamics; that is, how do people differ in how they prototypically change over time? 
+
+First, we'll start off with the problem we always need to solve when doing community detection:
+
+***__How do we define our adjacency matrix__***?
+
+Given that $\mathbf{A}$ is a symmetric matrix that defines how similar two things are, there is a host of ways for us to take the values from a dynamic model to define "similarity". Take--for instance--that we decide to fit a vector autoregressive (VAR) model to our data in the form:
+
+$$\mathbf{\eta}_{(t)} = \mathbf{\mu} + \mathbf{\Phi}\mathbf{\eta}_{(t-1)} + \mathbf{\zeta}_{t}$$
+
+where $\mathbf{\eta}$ is a p-variate vector of scores, $\mathbf{\mu}$ is a p-variate vector of intercepts, $\mathbf{\Phi}$ is a $p\times p$ lagged regression matrix, and $\mathbf{\zeta}$ is a p-variate residual vector assumed to have zero means and covariance matrix, $\mathbf{\Psi}$.
+
+Several parameters in the VAR(1) equation could be of use when attempting to identify unique subgroups of individuals. Subjects--as in the previous illustrations--could differ in their mean-levels across variables. In which case, $\mathbf{\mu}$ may be of interest to us. In addition, if one is interested in the dynamics and finding groups of individuals who change similarly to one another through time, the $\mathbf{\Phi}$ matrix may be worth investigating. Other researchers have also leveraged the residual covariance matrices or otherwise extracted information from them (i.e., graphical VAR) to further model contemporaneous effects.
+
+However, in addition to leveraging different elements of the VAR(1) model, we must also consider how we transform the information contained in the coefficient matrices to our definition of "distance" in the adjacency matrix. We can refer to past work on clustering VAR-based models for how they operationally defined their adjacency matrices. For instance, the subgrouping option in the group iterative multiple model estimation (S-GIMME) procedure counts the number of raw coefficients that are similar between any pair of subjects. If `Subject X` and `Subject Y` both share a connection, $\phi_{13}$ that is both statistically significant and identical in sign (i.e., $\pm$), then it is added into the cell, $a_{xy}$, of the adjacency matrix. Other methods like the subgrouping option for chain graphical VAR (scgVAR) models count all similar paths including if a pair of subjects share a common null path (i.e., $\phi_{13} = 0.00$). In a separate domain of work by Bulteel and colleagues (2016), VAR models have also been clustered based on the Euclidean distance of the elements of the $\mathbf{\Phi}$ between any pair of subjects. Thus, while some algorithms prioritize commonality in the raw structure, others prioritize the relative distance between coefficient matrices themselves. These nuanced differences may lead to various effects on the clustered solution.
+
+For instance, the ALS VAR--in an effort to maximally separate the generated clusters--tends to avoid allowing subgroups to share common paths with one another. In contrast, the S-GIMME and scgVAR approaches do not have this tendency. In contrast, the ALS VAR is able to detect differences between groups based on effect sizes (i.e., $\phi_{13} = 0.21$ vs $\phi_{13} = 0.63$). This then leads down an entire rabbit hole on whether we think difference in magnitude constitute differences between groups that I will not get involved in. This discussion also completely leaves out that some algorithms (e.g., S-GIMME) leverage additional information beyond the simple $\mathbf{\Phi}$ matrices by making use of contemporaneous effects as well when constructing the adjacency matrix. 
+
+The role of "fuzziness" in the clustering of VAR-based models then becomes an interesting issue. What makes a subject "fuzzy"? When constructing adjacency matrices in the fashion similar to S-GIMME or the scgVAR models, it may be a subject who has many structural similarities to multiple groups and could be indicative of a subject that is functionally between two "states"; if we define a state as a common (sub)group model. In the following illustrations, we will use the raw counts in a manner similar to S-GIMME by doing the following steps:
+
+  1. Estimate VAR(1) models on each subject in the dataset
+  2. Prune all nonsignificant paths from the resulting $\mathbf{\Phi}_1$ matrices
+  3. Construct an adjacency matrix, $\mathbf{A}$ where each cell, $a_{ij}$ is a count of the number of elements of $\mathbf{\Phi}$ that the $i^{th}$ and $j^{th}$ subjects share in common
+    3a. Commonality is defined as the same non-zero edge with the same polarity (i.e., $\phi_{i,32} = +$ \& $\phi_{j,32} = +$)
+  4. Apply $k$-means and fuzzy $c$-means to the resulting adjacency matrix to extract solutions
+
+<!-- Here are some notable parameters we could use: -->
+
+<!--   1. The elements of the $\mathbf{\Phi}$ matrix -->
+<!--   2. The similarity among the raw data-points -->
+<!--   3. The distance between the covariance matrices -->
+<!--   4. The distance between the residual covariance matrices -->
+<!--   5. A combination of any of the above approaches -->
+
+<!-- The first element is the most common and has been implemented in things like `gimme()`, `scgvar()`, and the alternating least squares (ALS) VAR models and is done with raw counts or euclidean distances in the case of the ALS VAR. -->
+
+<!-- For brevity, I'm not going to go over all of the things that Sy-Miin, Peter, Zack, and I have tried to work through this issue but I will show what happens if we use the $\mathbf{\Phi}$ parameters.  -->
+
+### VAR-based Clustering on De Vos (2017)
+
+Below, we will cluster the VAR(1) models from the De Vos (2017) dataset using the method described above. In the code chunk below, we read in the imputed dataset, trim off some cases that have had convergence issues in the past and fit the VAR(1) model to each subject in an iterative fashion. Following this, we save out the $\mathbf{\Phi}$ matrices and remove all non-significant paths resulting in sparse regression matrices for each subject and we can then proceed to the creation of our adjacency matrix.
+
+```{r, echo = TRUE}
+data1 = read.csv('./Datasets/imputed.csv')
+    data1 = data1[!data1$id == 22,]
+    data1 = data1[!data1$id == unique(data1$id)[32],]
+    data1 = data1[!data1$id == unique(data1$id)[32],]
+    data1 = data1[!data1$id == unique(data1$id)[38],]
+mod.list = list()
+lag.mat = list()
+mod.covs = list()
+
+for(i in unique(data1$id)){
+  tmpdat = data1[data1$id == i,3:16]
+  mod.list[[i]] = VAR(tmpdat, p = 1, type = 'none')
+  lagmat = NULL
+  for(j in 1:14){
+    lagmat = rbind(lagmat, mod.list[[i]]$varresult[[j]][[1]])
+  }
+  lag.mat[[i]] = lagmat
+  mod.covs[[i]] = summary(mod.list[[i]])$covres
+}
+clag.mat = list(); cmod.covs = list()
+cmod.list = list(); covmats = list()
+for(i in 1:50){
+  cmod.list[[i]] = mod.list[[unique(data1$id)[i]]]
+  clag.mat[[i]] = lag.mat[[unique(data1$id)[i]]]
+  cmod.covs[[i]] = mod.covs[[unique(data1$id)[i]]]
+}
+mods=list()
+for(j in 1:50){
+  tmp = summary(cmod.list[[j]])
+  res = NULL
+  for(k in 1:14){
+    tmp1 = tmp$varresult[[k]][4][[1]][,c(1,4)]
+    test = matrix(NA, nrow(tmp1), 1)
+    for(i in 1:nrow(tmp1)){
+      test[i,] = ifelse(tmp1[i,2] < 0.05, tmp1[i,1], 0)  
+    }
+    res = rbind(res, c(test))  
+  }
+  mods[[j]] = res
+  
+  covmat = matrix(solve(c(diag(1,14^2)) - kronecker(res,res)) %*% 
+                    c(cmod.covs[[j]]), 14, 14)
+
+covmats[[j]] = buildSSCP(sample.cov = covmat, 
+                         sample.mean = rep(0,14), 
+                         sample.nobs = 90,
+                         namesofmat = paste0('V', 1:14))
+}
+```
+
+In the code chunk below, we create our adjacency matrix based on the significant VAR(1) $\mathbf{\Phi}$ coefficients that are common in sign and non-zero to match the S-GIMME construction method. Once the adjacency matrix is created, we set the diagonal elements to zero as is standard practice in community detection applications.
+
+```{r}
+adjmat = matrix(NA, 50, 50)
+adjmat.var = matrix(NA, 50, 50)
+for(i in 1:50){
+  for(j in 1:50){
+    adjmat.var[i,j] = sum(sign(c(mods[[i]])) == sign(c(mods[[j]])) &
+                        abs(c(mods[[i]])) > 0 & abs(c(mods[[j]])) > 0)
+    # adjmat.var[i,j] = sum(sign(c(clag.mat[[i]])) == sign(c(clag.mat[[j]])) &
+    #                     abs(c(clag.mat[[i]])) > 0 & abs(c(clag.mat[[j]])) > 0)
+    adjmat[i,j] = sum(sign(c(covmats[[i]])) == sign(c(covmats[[j]])) & 
+                        abs(c(covmats[[i]])) > 0 & abs(c(covmats[[j]])) > 0)
+  }
+}
+diags = NULL
+for(i in 1:50){
+  diags = rbind(diags, diag(clag.mat[[i]]))
+}
+
+diag(adjmat.var) = 0
+diag(adjmat) = 0
+```
+
+Now, we can apply the `FKM()` function onto the constructed adjacency matrix in both the hard- and fuzzy-clustering approaches. In the code chunk below, we apply the community detection approaches for a 2-group solution and print out the first 5-membership degrees. Recall, the membership degrees tell us how strongly one subject belongs to one subgroup or another and roughly sums to 1 across the number of enumerated subgroups.
+
+When we look at the hard 2-subgroup solution, we see that it looks promising! Of the first 5 subjects, all but one is classified with the others. Considering that the first 26 subjects are clinically depressed this seems like a good start. 
+
+```{r}
+round(FKM(adjmat.var,2,1.01)$U[1:5,], 2)
+```
+
+Out of curiosity's sake, let's expand this out to all of the depressed subjects which we do below. On further inspection, 11 subjects are classified into group 1 and 15 are classified in group 2. A much wider split that the first 5-cases would have led us to believe.
+
+```{r}
+round(FKM(adjmat.var,2,1.01)$U[1:26,], 2)
+```
+
+Now, for illustration, we can try fuzzy clustering on the same data. The result below suggests that the values are 0.5 in either direction for the membership degrees. This indicates that our algorithm is not confident in the placement of any one individual to any given cluster. Thus, we can likely infer that the hard clustering solution is mostly noise.
+
+```{r}
+FKM(adjmat.var,2,2)$U[1:5,]
+```
+
+Let's try visualizing the subject-by-subject network and apply coloring based on the cluster solutions in the code chunk below. What we see is that the hard clustering solution essentially creates concentric subgroups where the inner, green subgroup is surrounded by the red subgroup. Moreover, the similarities between--for example--Subject 39 and Subject 14 are 0. Thus, they shouldn't really even be in a community together at all.
+
+```{r, fig.width = 10.00, fig.height = 5.00}
+par(mfrow = c(2,1))
+cols1 = FKM(adjmat.var,2,1.01)$clus[,1]
+cols2 = apply(FKM(adjmat.var,2,2)$U, 1, max) < 0.70
+cols2 = ifelse(as.numeric(cols2), 'gray', 'white')
+qgraph(adjmat.var, layout = 'spring', color = cols1, title = 'K-Means')
+qgraph(adjmat.var, layout = 'spring', color = cols2, title = 'Fuzzy C-Means')
+```
+
+Lets take a look at the 2 subgroup solution brought to use by the k-means algorithm by fitting a group-level model within each subgroup which we do below. Overall, the groups do look distinctly different with one model characterized by many significantly strong connections in contrast to the other which is much weaker but stronger in the autoregressive terms for certain variables such as depression, guilt, and anxiety. All certainly stronger than the first subgroup pictured on top.
+
+But if we were to look into a specific subset of subjects within that first group, we may find something interesting.
+
+```{r}
+s1 = unique(data1$id)[cols1==1]
+s2 = unique(data1$id)[!cols1==1]
+tmpdat = data1[data1$id %in% s1, 3:16]
+mod1 = VAR(tmpdat, p = 1, type = 'none')
+lagmat = NULL
+for(j in 1:14){
+  lagmat = rbind(lagmat, mod1$varresult[[j]][[1]])
+}
+lagmat = rbind(lagmat, mod1$varresult[[j]][[1]])
+tmp = summary(mod1)
+res = NULL
+for(k in 1:14){
+  tmp1 = tmp$varresult[[k]][4][[1]][,c(1,4)]
+  test = matrix(NA, nrow(tmp1), 1)
+  for(i in 1:nrow(tmp1)){
+    test[i,] = ifelse(tmp1[i,2] < 0.05, tmp1[i,1], 0)  
+  }
+  res = rbind(res, c(test))  
+}
+res1=res
+tmpdat = data1[data1$id %in% s2, 3:16]
+mod1 = VAR(tmpdat, p = 1, type = 'none')
+lagmat = NULL
+for(j in 1:14){
+  lagmat = rbind(lagmat, mod1$varresult[[j]][[1]])
+}
+lagmat = rbind(lagmat, mod1$varresult[[j]][[1]])
+tmp = summary(mod1)
+res = NULL
+for(k in 1:14){
+  tmp1 = tmp$varresult[[k]][4][[1]][,c(1,4)]
+  test = matrix(NA, nrow(tmp1), 1)
+  for(i in 1:nrow(tmp1)){
+    test[i,] = ifelse(tmp1[i,2] < 0.05, tmp1[i,1], 0)  
+  }
+  res = rbind(res, c(test))  
+}
+par(mfrow = c(2,1))
+lay = averageLayout(list(qgraph(res1),qgraph(res)))
+qgraph(res1, layout = lay, theme = 'colorblind', edge.labels = TRUE, labels = vars, maximum = 0.5)
+qgraph(res, layout = lay, theme = 'colorblind', edge.labels = TRUE, labels = vars, maximum = 0.5)
+```
+
+I had noted earlier that several subjects in the group above were not even remotely connected to each other in the adjacency matrix. If we want to consider the fact that subjects within the outer subgroup have literally nothing in common, we can highlight that by showing a sample of 2 subjects. We see that not only do these subject's models widely differ from the subgroup that they're in. They also significantly differ from each other. This wide degree of heterogeneity within the sample was highlighted by De Vos and colleagues (2017).
+
+```{r}
+par(mfrow = c(2,1))
+lay = averageLayout(list(qgraph(mods[[14]]),qgraph(mods[[39]])))
+qgraph(mods[[14]], layout = lay, theme = 'colorblind', edge.labels = TRUE, labels = vars, fade = TRUE)
+qgraph(mods[[39]], layout = lay, theme = 'colorblind', edge.labels = TRUE, labels = vars, fade = TRUE)
+```
+
+We can repeat this process by looking at various metrics besides the $\mathbf{\Phi}$ matrices. We can try creating an adjacency matrix using the model implied covariance matrices which we do below. In this case, we do not particularly find any strong group separations.
+
+```{r}
+FKM(adjmat,2,2)$U[1:3,]
+FKM(adjmat,3,2)$U[1:3,]
+FKM(adjmat,4,2)$U[1:3,]
+```
+
+Across the board when enumerating 2 through 7 groups, there isn't really a clear distinction between subjects into groups. Does this mean that dynamics are worthless? Nope! In fact, finding no groups is likely a positive sign in the presence of widespread heterogeneity in dynamics. What if we tried looking only at the AR effects?
+
+```{r}
+FKM(diags,2,2)$U[1:3,]
+FKM(diags,3,2)$U[1:3,]
+FKM(diags,4,2)$U[1:3,]
+```
+
+What about ***select*** AR effects? Namely, only looking at the AR-terms for `happiness` and `depression`:
+
+```{r, echo = FALSE, fig.width = 7.5, fig.height = 5}
+hep1=FKM(diags[,c(11,12)],2,2)
+hep2=FKM(diags[,c(11,12)],3,2)
+plot(hep1, v1v2 = c(1,2), umin=0.7)
+plot(hep2, v1v2 = c(1,2), umin=0.7)
+```
+
+From the plot here, we see that the separation is based primarily on the AR term associated with `happiness` and less so from depression and--on personal checking--there isn't really an association with clinical memberships but it is interesting that the data are divided in the finely-tuned ways! ***__This isn't a suggestion that we dig through out data and try to find any set of clusters but rather to highlight that careful consideration needs to go into the content of the adjacency matrix__***. 
+
+Ultimately, the decision of what we put into our adjacency matrices will determine the quality of our partitions and whether our partitions are meaningful. If theory guides us towards one avenue, we should pursue it. 
+
+
+# Next Steps
+
+So far, we've seen that subjects can be clustered in a hard fashion as well as in a fuzzy fashion on their means and their dynamics with ultimate consideration coming down to theory.
+
+However, does that mean that clustering on dynamics is *worthless*? No, absolutely not. De Vos and colleagues (2017) explicitly noted that their subjects were incredibly heterogeneous in their dynamics. In fact, it should be a good thing that we similarly don't find clear separations between groups as it reaffirms their work.
+
+But what if we ***did*** have a clear separation between groups? Maybe in simulation land, we could see how well our algorithms perform..
+
+### Simulation Land!
+
+Below, I simulated $N = 30$ subjects in Simulation Land. 10-subjects are defined by one VAR model and 10-subjects are defined by another. While the final 10 are a mixture of the two distinct groups.
+
+The groups are separated by 9 distinct cross-regressions and had 500 simulated time-points each.
+
+```{r, echo = FALSE}
+mod.list = list();lag.mat = list(); 
+mod.covs = list();covmats = list();mods=list()
+sample = 30
+p=10
+for(i in 1:sample){
+  tmpdat = read.table(paste0('~/Desktop/MixAR/Data10/MixAR_Subj ',i,'.dat'))[,1:p]
+  mod.list[[i]] = VAR(tmpdat, p = 1, type = 'none')
+  lagmat = NULL
+  for(j in 1:p){
+    lagmat = rbind(lagmat, mod.list[[i]]$varresult[[j]][[1]])
+  }
+  lag.mat[[i]] = lagmat
+  mod.covs[[i]] = summary(mod.list[[i]])$covres
+}
+for(j in 1:sample){
+  tmp = summary(mod.list[[j]])
+  res = NULL
+  for(k in 1:p){
+    tmp1 = tmp$varresult[[k]][4][[1]][,c(1,4)]
+    test = matrix(NA, nrow(tmp1), 1)
+    for(i in 1:nrow(tmp1)){
+      test[i,] = ifelse(tmp1[i,2] < 0.05, tmp1[i,1], 0)  
+    }
+    res = rbind(res, c(test))  
+  }
+  mods[[j]] = res
+  # covmat = matrix(solve(c(diag(1,2^2)) - kronecker(res[,1:2],res[,1:2])) %*% 
+  #                   c(mod.covs[[j]]), 2, 2)
+covmats[[j]] = matrix(solve(c(diag(1,p^2)) - kronecker(res[,1:p],res[,1:p])) %*% 
+                    c(mod.covs[[j]]), p, p)
+}
+adjmat = matrix(NA, sample, p^2);adjvar = matrix(NA, sample, ((p^2)+p))
+adjmatvar = matrix(NA, 30, 30)
+# for(i in 1:sample){
+#   adjmat[i,] = covmats[[i]]
+#   adjvar[i,] = mods[[i]]
+# }
+for(i in 1:30){
+  for(j in 1:30){
+    adjmatvar[i,j] = sum(c(abs(mods[[i]])) > 0 & c(abs(mods[[j]])) > 0 &
+      sign(c(mods[[i]])) == sign(c(mods[[j]])))
+  }
+}
+(clust11=FKM(adjmatvar,k=2,m=1.02))
+(clust12=FKM(adjmatvar,k=3,m=1.02))
+(clust21=FKM(adjmatvar,k=2,m=2))
+(clust22=FKM(adjmatvar,k=3,m=2))
+(clust23=FKM(adjmatvar,k=4,m=2))
+(clust24=FKM(adjmatvar,k=5,m=2))
+
+round(Fclust.index(clust11),2); round(Fclust.index(clust12),2)
+round(Fclust.index(clust21),2); round(Fclust.index(clust22),2)
+round(Fclust.index(clust23),2); round(Fclust.index(clust24),2)
+```
+
+### VAR Clustering Results
+
+After fitting the VAR models to each subject using the `VAR()` function in the `vars` package, we then save the resulting $\mathbf{\Phi}$ matrices and construct an adjacency matrix.
+
+Upon searching it with hard and soft clustering, we find the following:
+
+```{r, echo = FALSE, fig.width=7.5,fig.height=5}
+par(mfrow = c(2,2))
+plot(1:30, clust11$clus[,1], xlab = 'Subject', ylab = 'Group; 1 or 2')
+plot(1:30, clust12$clus[,1], xlab = 'Subject', ylab = 'Group; 1, 2, or 3')
+plot(1:30, clust21$clus[,2], xlab = 'Subject', ylab = 'Membership Degree',
+     ylim = c(0.0,1))
+abline(h=0.7)
+plot(1:30, clust22$clus[,2], xlab = 'Subject', ylab = 'Membership Degree',
+     ylim = c(0.0,1))
+abline(h=0.7)
+# 
+# round(Fclust.index(clust11),2)
+# round(Fclust.index(clust12),2)
+# round(Fclust.index(clust21),2)
+```
+
+Essentially, even though we have explicitly fuzzy subjects, the hard clustering algorithm forces them into one set or another. In contrast, a hard 3-group solution separates out the fuzzy subjects into a distinct group, and our fuzzy analysis acknowledges them as uncertainly placed.
+
+If we compare the hard cluster solutions (2 or 3 groups), we actually find that the 2 group solution scores better than the 3 group solution:
+
+```{r}
+  round(Fclust.index(clust11),2)
+  round(Fclust.index(clust12),2)
+```
+
+### Influence of a Wrong and Fuzzy Subject
+
+Now, what's wrong with accidentally placing a fuzzy person with the wrong group? Well, it fudges our parameters. Let's look back at the 2-group solution for the hard clustering VAR. We see that the algorithm says that subjects 11 through 30 belong together.
+
+So, what's the bias introduced by incorporating those additional 10 wrong subjects into the correct second model?
+
+```{r, echo = FALSE}
+index=1
+p=10
+sample=c(1:30)
+tmpdat = NULL
+for(i in sample){
+  tmpdat = rbind(tmpdat, read.table(paste0('~/Desktop/MixAR/Data10/MixAR_Subj ',i,'.dat'))[,1:p])
+}
+  themod = VAR(tmpdat, p = 1, type = 'none')
+  lagmat = NULL
+  for(j in 1:p){
+    lagmat = rbind(lagmat, themod$varresult[[j]][[1]])
+  }
+  lag.mat = lagmat
+  mod.covs = summary(themod)$covres
+  index = index+1
+  tmp = summary(themod)
+  res = NULL
+  for(k in 1:p){
+    tmp1 = tmp$varresult[[k]][4][[1]][,c(1,4)]
+    test = matrix(NA, nrow(tmp1), 1)
+    for(i in 1:nrow(tmp1)){
+      test[i,] = ifelse(tmp1[i,2] < 0.05, tmp1[i,1], 0)  
+    }
+    res = rbind(res, c(test))  
+  }
+wrongs = mean(abs(res - phi1)[abs(res - phi1)>0])
+wrongsd = sd(abs(res - phi1)[abs(res - phi1)>0])
+index=1
+p=10
+sample=c(11:20)
+tmpdat = NULL
+for(i in sample){
+  tmpdat = rbind(tmpdat, read.table(paste0('~/Desktop/MixAR/Data10/MixAR_Subj ',i,'.dat'))[,1:p])
+}
+  themod = VAR(tmpdat, p = 1, type = 'none')
+  lagmat = NULL
+  for(j in 1:p){
+    lagmat = rbind(lagmat, themod$varresult[[j]][[1]])
+  }
+  lag.mat = lagmat
+  mod.covs = summary(themod)$covres
+  index = index+1
+  tmp = summary(themod)
+  res = NULL
+  for(k in 1:p){
+    tmp1 = tmp$varresult[[k]][4][[1]][,c(1,4)]
+    test = matrix(NA, nrow(tmp1), 1)
+    for(i in 1:nrow(tmp1)){
+      test[i,] = ifelse(tmp1[i,2] < 0.05, tmp1[i,1], 0)  
+    }
+    res = rbind(res, c(test))  
+  }
+rights = mean(abs(res - phi1)[abs(res - phi1)>0])
+rightsd = sd(abs(res - phi1)[abs(res - phi1)>0])
+
+resultz = matrix(c(round(rights,3), round(wrongs,3), round(rightsd,3), round(wrongsd,3)), 
+                 2, 2, byrow = TRUE)
+colnames(resultz) = c('Correct', 'Incorrect')
+rownames(resultz) = c('Mean', 'SD')
+knitr::kable(resultz)
+# 
+# avgg = averageLayout(list(qgraph(res[1:10,]),qgraph(res[11:20,]),qgraph(res[21:30,])), layout = 'spring')
+# graphics.off()
+# qgraph(res[1:10,], layout = avgg, theme = 'colorblind')
+# qgraph(res[11:20,], layout = avgg, theme = 'colorblind')
+# qgraph(res[21:30,], layout = avgg, theme = 'colorblind')
+```
+
+The absolute bias is shown above in just a single replication and we see that--in general--the absolute bias is 2x in the wrong model with greater SD as well. In terms of relative bias, both models do well in recovering the true AR coefficients because... well... everyone has those. But in the cross-regression parameters, inclusion of the wrong subjects results in a significant increase in the relative biases going as high as -0.29 compared to 0.09 in the correct grouping scenario.
+
+### Ongoing Questions
+
+Other ways of calculating influence? We've been trying to incorporate the multivariate Cook's Distance as well as using the innovative outliers functionality in dynr [not included because that would take 18 years to run and compile] and have not necessarily found immense success in highlight the effects a wrong person may have on the sample in a way that is immediately obvious and clear.
+
